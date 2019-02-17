@@ -8,14 +8,7 @@ class App extends Component {
       <div className="App">
         <header className="App-header">
           <img src={logo} className="App-logo" alt="logo" />
-          <p>23423423423Hi There! sdfsfsdf test sdsdfsd sdfsdf
-            asdasdasd
-            asdadaasdads
-            assaasdasd asdasd
-            asdasdasd asdasd asd adadsasd
-            asdasdasdasdasdasNawal
-            asdadasdasd
-            asdaadadas
+          <p>I was changed into feature Branch
           </p>
           <a
             className="App-link"
