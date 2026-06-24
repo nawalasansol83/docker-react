@@ -23,3 +23,305 @@
     "not op_mini all"
   ]
 }
+
+require("dotenv").config();
+
+const crypto = require("crypto");
+const express = require("express");
+const session = require("express-session");
+const msal = require("@azure/msal-node");
+
+const {
+  SERVER_PORT = "3000",
+  APP_CLIENT_ID,
+  APP_CLIENT_SECRET,
+  SESSION_SECRET,
+  B2C_POLICY,
+  B2C_TENANT_DOMAIN,
+  B2C_AUTHORITY_DOMAIN,
+  APP_REDIRECT_URI,
+  APP_POST_LOGOUT_REDIRECT_URI,
+} = process.env;
+
+const requiredConfig = {
+  APP_CLIENT_ID,
+  APP_CLIENT_SECRET,
+  SESSION_SECRET,
+  B2C_POLICY,
+  B2C_TENANT_DOMAIN,
+  B2C_AUTHORITY_DOMAIN,
+  APP_REDIRECT_URI,
+};
+
+const missingConfig = Object.entries(requiredConfig)
+  .filter(([, value]) => !value)
+  .map(([key]) => key);
+
+if (missingConfig.length > 0) {
+  throw new Error(`Missing required .env values: ${missingConfig.join(", ")}`);
+}
+
+const authority = `https://${B2C_AUTHORITY_DOMAIN}/${B2C_TENANT_DOMAIN}/${B2C_POLICY}`;
+const authorityMetadata = JSON.stringify({
+  issuer: `${authority}/v2.0/`,
+  authorization_endpoint: `${authority}/oauth2/v2.0/authorize`,
+  token_endpoint: `${authority}/oauth2/v2.0/token`,
+  end_session_endpoint: `${authority}/oauth2/v2.0/logout`,
+  jwks_uri: `${authority}/discovery/v2.0/keys`,
+});
+
+const msalClient = new msal.ConfidentialClientApplication({
+  auth: {
+    clientId: APP_CLIENT_ID,
+    authority,
+    clientSecret: APP_CLIENT_SECRET,
+    knownAuthorities: [B2C_AUTHORITY_DOMAIN],
+    authorityMetadata,
+  },
+  system: {
+    loggerOptions: {
+      loggerCallback(loglevel, message, containsPii) {
+        if (!containsPii) {
+          console.log(message);
+        }
+      },
+      piiLoggingEnabled: false,
+      logLevel: msal.LogLevel.Info,
+    },
+  },
+});
+
+const app = express();
+
+app.use(
+  session({
+    name: "azure-b2c-node-sample.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false,
+    },
+  })
+);
+
+function buildAuthCodeUrlRequest(req) {
+  req.session.authState = crypto.randomBytes(16).toString("hex");
+
+  return {
+    authority,
+    scopes: ["openid", "profile", "offline_access"],
+    redirectUri: APP_REDIRECT_URI,
+    state: req.session.authState,
+  };
+}
+
+function buildTokenRequest(req) {
+  return {
+    authority,
+    code: req.query.code,
+    scopes: ["openid", "profile", "offline_access"],
+    redirectUri: APP_REDIRECT_URI,
+  };
+}
+
+function requireLogin(req, res, next) {
+  if (!req.session.account) {
+    return res.redirect("/login");
+  }
+
+  return next();
+}
+
+app.get("/", (req, res) => {
+  const account = req.session.account;
+
+  res.type("html").send(`
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Azure B2C Node Sample</title>
+        <style>
+          :root {
+            font-family: Arial, Helvetica, sans-serif;
+            color: #172033;
+            background: #f4f7fb;
+          }
+          body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+          }
+          main {
+            width: min(760px, calc(100vw - 32px));
+            background: white;
+            border: 1px solid #d9e0ec;
+            border-radius: 8px;
+            padding: 28px;
+            box-shadow: 0 18px 45px rgba(23, 32, 51, 0.08);
+          }
+          h1 {
+            margin: 0 0 8px;
+            font-size: 28px;
+          }
+          p {
+            line-height: 1.5;
+          }
+          a.button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 42px;
+            padding: 0 16px;
+            border-radius: 6px;
+            background: #1957a6;
+            color: white;
+            text-decoration: none;
+            font-weight: 700;
+          }
+          a.secondary {
+            margin-left: 8px;
+            background: #eef3fb;
+            color: #1957a6;
+          }
+          pre {
+            overflow-x: auto;
+            background: #101827;
+            color: #eaf0ff;
+            border-radius: 6px;
+            padding: 16px;
+          }
+          code {
+            font-family: Consolas, Monaco, monospace;
+          }
+        </style>
+      </head>
+      <body>
+        <main>
+          <h1>Azure AD B2C Custom Policy Login</h1>
+          <p>Authority: <code>${authority}</code></p>
+          ${
+            account
+              ? `
+                <p>Signed in as <strong>${account.name || account.username || account.homeAccountId}</strong>.</p>
+                <p>
+                  <a class="button" href="/profile">View profile claims</a>
+                  <a class="button secondary" href="/logout">Logout</a>
+                </p>
+              `
+              : `
+                <p>This sample starts the Authorization Code flow against your B2C policy and handles the redirect at <code>/redirect</code>.</p>
+                <p><a class="button" href="/login">Login with Azure B2C</a></p>
+              `
+          }
+        </main>
+      </body>
+    </html>
+  `);
+});
+
+app.get("/login", async (req, res, next) => {
+  try {
+    const authCodeUrl = await msalClient.getAuthCodeUrl(buildAuthCodeUrlRequest(req));
+    res.redirect(authCodeUrl);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/redirect", async (req, res, next) => {
+  try {
+    if (req.query.error) {
+      throw new Error(`${req.query.error}: ${req.query.error_description || "No error description returned."}`);
+    }
+
+    if (!req.query.code) {
+      throw new Error("Azure B2C redirect did not include an authorization code.");
+    }
+
+    if (req.query.state !== req.session.authState) {
+      throw new Error("Invalid state returned from Azure B2C.");
+    }
+
+    const tokenResponse = await msalClient.acquireTokenByCode(buildTokenRequest(req));
+    req.session.account = tokenResponse.account;
+    req.session.idTokenClaims = tokenResponse.idTokenClaims;
+    delete req.session.authState;
+
+    res.redirect("/");
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/profile", requireLogin, (req, res) => {
+  res.type("html").send(`
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Profile claims</title>
+        <style>
+          body {
+            margin: 0;
+            padding: 32px;
+            font-family: Arial, Helvetica, sans-serif;
+            color: #172033;
+            background: #f4f7fb;
+          }
+          a {
+            color: #1957a6;
+            font-weight: 700;
+          }
+          pre {
+            max-width: 100%;
+            overflow-x: auto;
+            background: #101827;
+            color: #eaf0ff;
+            border-radius: 6px;
+            padding: 16px;
+          }
+        </style>
+      </head>
+      <body>
+        <p><a href="/">Back home</a></p>
+        <h1>ID token claims</h1>
+        <pre>${JSON.stringify(req.session.idTokenClaims, null, 2)}</pre>
+      </body>
+    </html>
+  `);
+});
+
+app.get("/logout", (req, res, next) => {
+  const logoutUrl = new URL(`${authority}/oauth2/v2.0/logout`);
+  logoutUrl.searchParams.set("post_logout_redirect_uri", APP_POST_LOGOUT_REDIRECT_URI || `http://localhost:${SERVER_PORT}/`);
+
+  req.session.destroy((error) => {
+    if (error) {
+      return next(error);
+    }
+
+    return res.redirect(logoutUrl.toString());
+  });
+});
+
+app.use((error, req, res, next) => {
+  console.error(error);
+  res.status(500).type("html").send(`
+    <h1>Authentication error</h1>
+    <p>${error.message}</p>
+    <p><a href="/">Back home</a></p>
+  `);
+});
+
+app.listen(Number(SERVER_PORT), () => {
+  console.log(`Server listening at http://localhost:${SERVER_PORT}`);
+  console.log(`Using authority ${authority}`);
+});
+
